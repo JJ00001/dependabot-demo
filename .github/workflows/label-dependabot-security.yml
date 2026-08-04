@@ -4,30 +4,74 @@ on:
   pull_request:
     types: [opened, reopened, synchronize]
 
-permissions: {}
+permissions:
+  pull-requests: read
 
 jobs:
   label-security-update:
     if: github.event.pull_request.user.login == 'dependabot[bot]'
     runs-on: ubuntu-latest
-    timeout-minutes: 5
 
     steps:
-      - name: Fetch Dependabot metadata
-        id: metadata
-        uses: dependabot/fetch-metadata@25dd0e34f4fe68f24cc83900b1fe3fe149efef98 # v3.1.0
+      - name: Verify Dependabot PR
+        uses: dependabot/fetch-metadata@25dd0e34f4fe68f24cc83900b1fe3fe149efef98
         with:
-          alert-lookup: true
-          github-token: ${{ secrets.PERSONAL_TEST_DEPENDABOT_PR_LABEL_TOKEN }}
+          github-token: ${{ github.token }}
 
-      - name: Add security label
-        if: steps.metadata.outputs.alert-state != ''
+      # Workaround for https://github.com/dependabot/fetch-metadata/issues/719
+      # fetch-metadata v3.1.0 can return an empty alert-state for genuine security
+      # update PRs. Until that issue is fixed in a release, query GitHub's exact
+      # alert -> Dependabot update -> pull request relationship directly.
+      - name: Add security label when linked to an open alert
         env:
           GH_TOKEN: ${{ secrets.PERSONAL_TEST_DEPENDABOT_PR_LABEL_TOKEN }}
-          GH_REPO: ${{ github.repository }}
+          OWNER: ${{ github.repository_owner }}
+          REPOSITORY: ${{ github.event.repository.name }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
-        run: >
-          gh api
-          --method POST
-          "repos/$GH_REPO/issues/$PR_NUMBER/labels"
-          -f 'labels[]=security'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          alerts="$(
+            gh api graphql --paginate --slurp \
+              -F owner="$OWNER" \
+              -F repository="$REPOSITORY" \
+              -f query='
+                query($owner: String!, $repository: String!, $endCursor: String) {
+                  repository(owner: $owner, name: $repository) {
+                    vulnerabilityAlerts(first: 100, after: $endCursor, states: [OPEN]) {
+                      nodes {
+                        dependabotUpdate {
+                          pullRequest { number }
+                        }
+                      }
+                      pageInfo {
+                        hasNextPage
+                        endCursor
+                      }
+                    }
+                  }
+                }
+              '
+          )"
+
+          is_security="$(
+            jq -r --argjson pr "$PR_NUMBER" '
+              any(
+                .[].data.repository.vulnerabilityAlerts.nodes[]?;
+                .dependabotUpdate.pullRequest.number == $pr
+              )
+            ' <<< "$alerts"
+          )"
+
+          if [[ "$is_security" != "true" ]]; then
+            echo "No open Dependabot alert is linked to PR #$PR_NUMBER."
+            exit 0
+          fi
+
+          gh api --method POST \
+            "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/labels" \
+            -f 'labels[]=security' \
+            --silent
+
+          echo "Added the security label to PR #$PR_NUMBER."
